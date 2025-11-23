@@ -30,79 +30,54 @@ function to12Hour(time24) {
   return `\( {hh12}: \){String(mm).padStart(2, "0")}${period}`;
 }
 
-/**
- * Real Smiles API scraper (Nov 2025 working endpoint)
- */
-async function searchSmilesAwards(origin, dest, dateISO) {
-  const payload = {
-    adults: 1,
-    cabinType: "ALL",
-    children: 0,
-    departureDate: dateISO,
-    destinationAirportCode: dest,
-    infants: 0,
-    isFlexibleDate: false,
-    originAirportCode: origin,
-    tripType: "OW",
-    currencyCode: "BRL",
-  };
+/**async function searchSmilesAwards(origin, dest, dateISO) {
+  const apiUrl = `https://api-air-flightsearch-green.smiles.com.br/v1/airlines/search?cabin=ALL&originAirportCode=\( {origin}&destinationAirportCode= \){dest}&departureDate=${dateISO}&memberNumber=&adults=1&children=0&infants=0&forceCongener=false`;
 
-  const res = await fetch("https://www.smiles.com.br/mfe/api/v2/search", {
-    method: "POST",
+  const res = await fetch(apiUrl, {
+    method: "GET",
     headers: {
-      "Content-Type": "application/json",
-      "Origin": "https://www.smiles.com.br",
-      "Referer": "https://www.smiles.com.br/emissao-passagem",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "x-app": "mfe",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept": "application/json",
+      "Referer": "https://www.smiles.com.br/",
     },
-    body: JSON.stringify(payload),
   });
 
-  if (!res.ok) {
-    throw new Error(`Smiles API error ${res.status}`);
-  }
+  if (!res.ok) return [];
 
   const data = await res.json();
   const flights = [];
 
-  for (const seg of data?.requestedFlightSegmentList || []) {
-    const { departure, arrival, airlineName } = seg;
+  for (const seg of data?.flights || data?.requestedFlightSegmentList || []) {
+    const { departure, arrival, airlineName, fareOptions = [] } = seg;
 
     let econPts = null;
     let busPts = null;
     let taxesBRL = null;
 
-    for (const fare of seg.fareOptions || []) {
+    for (const fare of fareOptions) {
       const points = fare.miles || fare.points || 0;
-      const money = fare.money || fare.taxes || 0; // comes in cents (reais)
-      const taxes = money / 100;
+      const money = (fare.money || fare.taxes || 0) / 100;
 
-      const isBusiness =
-        fare.cabin === "BUSINESS" ||
-        fare.classOfService?.toUpperCase().includes("J") ||
-        fare.cabinType === "BUSINESS";
+      const isBusiness = fare.cabin === "BUSINESS" || fare.classOfService?.toUpperCase().includes("J");
 
-      if (isBusiness) {
+      if (isBusiness && points > 0) {
         busPts = points;
-        taxesBRL = taxes;
-      } else {
+        taxesBRL = money;
+      } else if (points > 0) {
         econPts = points;
-        taxesBRL = taxes;
+        taxesBRL = money;
       }
     }
 
-    if (econPts !== null || busPts !== null) {
+    if (econPts || busPts) {
       flights.push({
-        airline: airlineName || "Unknown",
-        originCode: departure.airportCode,
-        destCode: arrival.airportCode,
-        dep: departure.time?.slice(0, 5) || "",
-        arr: arrival.time?.slice(0, 5) || "",
-        depDate: departure.date,
-        econPts: econPts,
-        busPts: busPts,
+        airline: airlineName || "GOL/Partner",
+        originCode: departure?.airportCode || origin,
+        destCode: arrival?.airportCode || dest,
+        dep: departure?.time?.slice(0, 5) || "",
+        arr: arrival?.time?.slice(0, 5) || "",
+        econPts,
+        busPts,
         taxesBRL,
       });
     }
@@ -110,8 +85,6 @@ async function searchSmilesAwards(origin, dest, dateISO) {
 
   return flights;
 }
-
-/**
  * Build the exact response format you love
  */
 function buildResponse({ flights, maxPoints = Infinity }) {
