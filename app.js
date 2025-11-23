@@ -68,3 +68,78 @@ async function searchSmilesAwards(origin, dest, dateISO) {
         });
       }
     }
+    return flights;
+  } catch (e) {
+    console.error("Smiles API error:", e.message);
+    return [];
+  }
+}
+
+/** Response builder */
+function buildResponse({ flights, maxPoints = Infinity }) {
+  const valid = flights.filter(f => Math.min(f.econPts || Infinity, f.busPts || Infinity) <= maxPoints);
+  if (valid.length === 0) return "No award space found under your max points.";
+
+  let out = "";
+  const groups = {};
+  valid.forEach(f => {
+    const key = `\( {f.airline} from \){f.originCode}`;
+    groups[key] = groups[key] || [];
+    groups[key].push(f);
+  });
+
+  for (const [title, list] of Object.entries(groups)) {
+    out += `=== ${title} ===\n\n`;
+    list.sort((a, b) => a.dep.localeCompare(b.dep));
+    list.forEach(f => {
+      const dep12 = to12Hour(f.dep);
+      const arr12 = to12Hour(f.arr);
+      const econ = f.econPts ? f.econPts : "-";
+      const bus = f.busPts ? f.busPts : "-";
+      const taxes = f.taxesBRL ? brlToUsd(f.taxesBRL) : "-";
+      const lowest = econ !== "-" ? econ : bus;
+
+      out += `\( {f.originCode} \){dep12} – \( {f.destCode} \){arr12}\n`;
+      out += `  Economy: \( {econ} | Business: \){bus}\n`;
+      out += `  1=${lowest} pts  2=\[ {taxes} taxes\n`;
+      if (f.econPts) out += `    (≈ \]{ptsValueUsd(f.econPts).toFixed(2)} value)\n`;
+      if (f.busPts) out += `    (≈ $${ptsValueUsd(f.busPts).toFixed(2)} value)\n\n`;
+    });
+  }
+  return out.trim();
+}
+
+/** WhatsApp webhook */
+app.post("/whatsapp-webhook", async (req, res) => {
+  try {
+    const incoming = (req.body.Body || "").trim().toUpperCase();
+    const match = incoming.match(/([A-Z]{3})-([A-Z]{3})\s+([\d-]{10})(?:\s+MAX=(\d+))?/i);
+    if (!match) {
+      return res.type("text/xml").send("<Response><Message>Format: JFK-GRU 2025-12-20 max=40000</Message></Response>");
+    }
+
+    const [, originCity, dest, dateISO, maxStr] = match;
+    const maxPoints = maxStr ? Number(maxStr) : Infinity;
+    const origins = originCity === "NYC" ? ["JFK", "LGA", "EWR"] : [originCity];
+
+    let allFlights = [];
+    for (const o of origins) {
+      const flights = await searchSmilesAwards(o, dest, dateISO);
+      allFlights.push(...flights);
+    }
+
+    const text = buildResponse({ flights: allFlights, maxPoints }) || "No award space found.";
+
+    res.type("text/xml").send(`
+<Response>
+  <Message>${text}</Message>
+</Response>
+    `.trim());
+  } catch (err) {
+    console.error(err);
+    res.type("text/xml").send("<Response><Message>Sorry, something went wrong.</Message></Response>");
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Smiles bot running on port ${PORT}`));
