@@ -1,151 +1,173 @@
-// app.js - Smiles WhatsApp Bot - WORKING NOV 2025
+// app.js - Smiles WhatsApp Bot with Puppeteer (Works Nov 2025)
 import express from "express";
-import fetch from "node-fetch";
+import puppeteer from "puppeteer";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const BRL_TO_USD = 5.8;
+const BRL_TO_USD_RATE = 5.8;
 
 function brlToUsd(brl) {
-  return Math.round(brl / BRL_TO_USD);
+  return Number((brl / BRL_TO_USD_RATE).toFixed(0));
 }
 
-function to12h(t) {
-  if (!t) return "";
-  const [h, m] = t.split(":").map(Number);
-  const period = h >= 12 ? "pm" : "am";
-  const h12 = h % 12 || 12;
-  return `\( {h12}: \){m.toString().padStart(2, "0")}${period}`;
+function ptsValueUsd(points) {
+  if (points <= 20000) return points * 0.005;
+  if (points <= 40000) return points * 0.0045;
+  if (points <= 60000) return points * 0.0043;
+  return points * 0.004;
 }
 
-// CURRENT WORKING SMILES ENDPOINT - NOV 2025
-async function searchSmilesAwards(origin, dest, dateISO) {
-  const url = "https://flightsearch.smiles.com.br/search";
+function to12Hour(time24) {
+  if (!time24) return "";
+  const [hh, mm] = time24.split(":").map(Number);
+  const period = hh >= 12 ? "pm" : "am";
+  const hh12 = hh % 12 || 12;
+  return `\( {hh12}: \){String(mm).padStart(2, "0")}${period}`;
+}
 
-  const payload = {
-    adults: 1,
-    cabin: 0,
-    children: 0,
-    currencyCode: "BRL",
-    departureDate: dateISO,
-    destinationAirportCode: dest,
-    infants: 0,
-    isFlexibleDate: false,
-    originAirportCode: origin,
-    tripType: 1,
-    forceCongener: false,
-  };
+// Scrape Smiles with Puppeteer (beats bot protection)
+async function scrapeSmiles(origin, dest, dateISO) {
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-web-security"],
+  });
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 768 });
+  await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Origin": "https://www.smiles.com.br",
-        "Referer": "https://www.smiles.com.br/",
-      },
-      body: JSON.stringify(payload),
+    // Go to search page
+    await page.goto("https://www.smiles.com.br/busca-passagens", { waitUntil: "networkidle2", timeout: 30000 });
+
+    // Fill form (selectors from current DOM - Nov 2025)
+    await page.waitForSelector("[data-testid='origin-input']", { timeout: 10000 });
+    await page.fill("[data-testid='origin-input']", origin);
+    await page.click("[data-testid='origin-suggestion']"); // Select first suggestion
+
+    await page.fill("[data-testid='destination-input']", dest);
+    await page.click("[data-testid='destination-suggestion']");
+
+    await page.fill("[data-testid='departure-date']", dateISO);
+    await page.click("[data-testid='search-button']");
+
+    // Wait for results
+    await page.waitForSelector(".flight-card", { timeout: 30000 });
+
+    // Extract flights
+    const flights = await page.evaluate(() => {
+      const rows = document.querySelectorAll(".flight-card");
+      return Array.from(rows).map(row => {
+        const airline = row.querySelector(".airline-name")?.innerText?.trim() || "GOL";
+        const originCode = row.querySelector(".origin-code")?.innerText?.trim() || null;
+        const destCode = row.querySelector(".dest-code")?.innerText?.trim() || null;
+        const dep = row.querySelector(".depart-time")?.innerText?.trim() || "";
+        const arr = row.querySelector(".arrival-time")?.innerText?.trim() || "";
+        
+        // Points and taxes from award sections
+        const econPts = row.querySelector("[data-testid='economy-points']")?.innerText?.match(/(\d+)/)?.[1] || null;
+        const busPts = row.querySelector("[data-testid='business-points']")?.innerText?.match(/(\d+)/)?.[1] || null;
+        const taxesText = row.querySelector(".taxes-amount")?.innerText?.trim() || "";
+        const taxesBRL = taxesText.match(/R\$\s*([\d.,]+)/)?.[1]?.replace(/\./g, '').replace(',', '.') || 0;
+
+        return { airline, originCode, destCode, dep, arr, econPts: parseInt(econPts) || null, busPts: parseInt(busPts) || null, taxesBRL: parseFloat(taxesBRL) };
+      }).filter(f => f.econPts || f.busPts);
     });
 
-    if (!res.ok) return [];
-
-    const data = await res.json();
-    const flights = [];
-
-    for (const f of data?.flights || []) {
-      const fare = f.recommendedFare || {};
-      const econ = fare.economy?.miles > 0 ? fare.economy.miles : null;
-      const bus = fare.business?.miles > 0 ? fare.business.miles : null;
-      const taxes = (fare.taxes || 0) / 100;
-
-      if (econ || bus) {
-        flights.push({
-          airline: "GOL",
-          originCode: f.departure.airportCode,
-          destCode: f.arrival.airportCode,
-          dep: f.departure.time.slice(0, 5),
-          arr: f.arrival.time.slice(0, 5),
-          econPts: econ,
-          busPts: bus,
-          taxesBRL: taxes,
-        });
-      }
-    }
     return flights;
   } catch (e) {
-    console.error("Smiles error:", e.message);
+    console.error("Scrape error:", e.message);
     return [];
+  } finally {
+    await browser.close();
   }
 }
 
-function buildResponse(flights, maxPoints = Infinity) {
-  const valid = flights.filter(
-    (f) => Math.min(f.econPts || Infinity, f.busPts || Infinity) <= maxPoints
-  );
+function buildResponse({ flights, maxPoints = Infinity }) {
+  const valid = flights.filter(f => Math.min(f.econPts || Infinity, f.busPts || Infinity) <= maxPoints);
+  if (!valid.length) return "No award space found under your max points.";
 
-  if (valid.length === 0) return "No award space found under your max points.";
+  const both = valid.filter(f => f.econPts && f.busPts);
+  const econOnly = valid.filter(f => f.econPts && !f.busPts);
+  const busOnly = valid.filter(f => !f.econPts && f.busPts);
+
+  function sortByDep(arr) {
+    return arr.sort((a, b) => a.dep.localeCompare(b.dep));
+  }
+
+  const sections = [
+    { title: "Both Economy & Business", items: sortByDep(both) },
+    { title: "Economy only", items: sortByDep(econOnly) },
+    { title: "Business only", items: sortByDep(busOnly) },
+  ];
 
   let out = "";
-  const groups = {};
-  valid.forEach((f) => {
-    const key = `\( {f.airline} \){f.originCode}`;
-    groups[key] = groups[key] || [];
-    groups[key].push(f);
+  sections.forEach(sec => {
+    if (!sec.items.length) return;
+    out += `=== ${sec.title} ===\n`;
+
+    const byOriginAirline = {};
+    sec.items.forEach(f => {
+      const key = `\( {f.originCode || "ORIG"}- \){f.airline || "AIRLINE"}`;
+      byOriginAirline[key] = byOriginAirline[key] || [];
+      byOriginAirline[key].push(f);
+    });
+
+    Object.entries(byOriginAirline).forEach(([key, list]) => {
+      const [origin, airline] = key.split("-");
+      out += `\n\( {airline} from \){origin}:\n`;
+      list.forEach(f => {
+        const dep12 = to12Hour(f.dep);
+        const arr12 = to12Hour(f.arr);
+        const econ = f.econPts ? `${f.econPts}` : "-";
+        const bus = f.busPts ? `${f.busPts}` : "-";
+        const taxesUSD = f.taxesBRL ? brlToUsd(f.taxesBRL) : "-";
+        const lowestPts = econ !== "-" ? econ : bus;
+
+        out += `\( {origin} \){dep12} - \( {f.destCode} \){arr12}\n`;
+        out += `  Economy pts: \( {econ} | Business pts: \){bus}\n`;
+        out += `  1=${lowestPts} (points)  2=\[ {taxesUSD} (USD taxes)\n`;
+        if (f.econPts) out += `    (points value est: \]{ptsValueUsd(f.econPts).toFixed(2)})\n`;
+        if (f.busPts) out += `    (points value est: $${ptsValueUsd(f.busPts).toFixed(2)})\n`;
+      });
+    });
+    out += "\n";
   });
 
-  for (const [title, list] of Object.entries(groups)) {
-    out += `=== ${title} ===\n\n`;
-    list.sort((a, b) => a.dep.localeCompare(b.dep));
-    list.forEach((f) => {
-      const dep = to12h(f.dep);
-      const arr = to12h(f.arr);
-      const econ = f.econPts ? f.econPts : "-";
-      const bus = f.busPts ? f.busPts : "-";
-      const taxes = f.taxesBRL ? brlToUsd(f.taxesBRL) : "-";
-      const lowest = econ !== "-" ? econ : bus;
-
-      out += `\( {f.originCode} \){dep} – \( {f.destCode} \){arr}\n`;
-      out += `  Economy: \( {econ} | Business: \){bus}\n`;
-      out += `  Points: ${lowest} + $${taxes} taxes\n\n`;
-    });
-  }
-  return out.trim();
+  return out;
 }
 
 app.post("/whatsapp-webhook", async (req, res) => {
   try {
-    const msg = (req.body.Body || "").trim().toUpperCase();
-    const match = msg.match(/([A-Z]{3})-([A-Z]{3})\s+([\d-]{10})(?:\s+MAX=(\d+))?/i);
-
+    const incoming = (req.body.Body || "").trim().toUpperCase();
+    const match = incoming.match(/([A-Z]{3})-([A-Z]{3})\s+([\d-]{10})(?:\s+MAX=(\d+))?/i);
     if (!match) {
-      return res.type("text/xml").send("<Response><Message>Format: JFK-GRU 2025-12-20 max=50000</Message></Response>");
+      return res.type("text/xml").send("<Response><Message>Format: NYC-GRU 2025-12-20 max=50000</Message></Response>");
     }
 
-    const [, originCity, dest, date, maxStr] = match;
-    const max = maxStr ? Number(maxStr) : Infinity;
-    const origins = originCity === "NYC" ? ["JFK", "LGA", "EWR"] : [originCity];
+    const [, originCity, dest, dateISO, maxStr] = match;
+    const maxPoints = maxStr ? Number(maxStr) : Infinity;
+    const originAirports = originCity === "NYC" ? ["JFK", "LGA", "EWR"] : [originCity];
 
     let allFlights = [];
-    for (const o of origins) {
-      const flights = await searchSmilesAwards(o, dest, date);
-      allFlights = allFlights.concat(flights);
+    for (const o of originAirports) {
+      const flights = await scrapeSmiles(o, dest, dateISO);
+      allFlights.push(...flights);
     }
 
-    const text = buildResponse(allFlights, max);
+    const responseText = buildResponse({ flights: allFlights, maxPoints });
 
     res.type("text/xml").send(`
 <Response>
-  <Message>${text}</Message>
+  <Message>${responseText}</Message>
 </Response>
     `.trim());
   } catch (err) {
     console.error(err);
-    res.type("text/xml").send("<Response><Message>Sorry, try again later.</Message></Response>");
+    res.type("text/xml").send("<Response><Message>Sorry, something went wrong. Try again later.</Message></Response>");
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Smiles Bot running on port ${PORT}`));
+app.listen(PORT, () => console.log("Smiles WhatsApp Bot running on", PORT));
