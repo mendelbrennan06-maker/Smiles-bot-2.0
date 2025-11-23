@@ -1,7 +1,6 @@
 {
   "name": "smiles-bot",
   "version": "1.0.0",
-  "description": "Smiles award flight WhatsApp bot",
   "main": "app.js",
   "type": "module",
   "scripts": {
