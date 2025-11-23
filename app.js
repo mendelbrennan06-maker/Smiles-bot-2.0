@@ -1,173 +1,122 @@
-// app.js - Smiles WhatsApp Bot with Puppeteer (Works Nov 2025)
 import express from "express";
+import bodyParser from "body-parser";
 import puppeteer from "puppeteer";
+import twilio from "twilio";
 
+// ======= CONFIGURE YOUR TWILIO WHATSAPP ========
+const TWILIO_SID = process.env.TWILIO_SID;
+const TWILIO_AUTH = process.env.TWILIO_AUTH;
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER; // Example: "whatsapp:+14155238886"
+const client = twilio(TWILIO_SID, TWILIO_AUTH);
+
+// ======= EXPRESS SERVER ========
 const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+const PORT = process.env.PORT || 3000;
 
-const BRL_TO_USD_RATE = 5.8;
+app.get("/", (req, res) => {
+  res.send("🚀 Smiles WhatsApp Bot is running!");
+});
 
-function brlToUsd(brl) {
-  return Number((brl / BRL_TO_USD_RATE).toFixed(0));
-}
-
-function ptsValueUsd(points) {
-  if (points <= 20000) return points * 0.005;
-  if (points <= 40000) return points * 0.0045;
-  if (points <= 60000) return points * 0.0043;
-  return points * 0.004;
-}
-
-function to12Hour(time24) {
-  if (!time24) return "";
-  const [hh, mm] = time24.split(":").map(Number);
-  const period = hh >= 12 ? "pm" : "am";
-  const hh12 = hh % 12 || 12;
-  return `\( {hh12}: \){String(mm).padStart(2, "0")}${period}`;
-}
-
-// Scrape Smiles with Puppeteer (beats bot protection)
-async function scrapeSmiles(origin, dest, dateISO) {
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-web-security"],
-  });
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1366, height: 768 });
-  await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-
+// ======= SCRAPER FUNCTION ========
+async function searchFlights(origin, destination) {
+  let browser;
   try {
-    // Go to search page
-    await page.goto("https://www.smiles.com.br/busca-passagens", { waitUntil: "networkidle2", timeout: 30000 });
+    browser = await puppeteer.launch({
+      headless: "new",
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-web-security",
+        "--disable-gpu"
+      ]
+    });
 
-    // Fill form (selectors from current DOM - Nov 2025)
-    await page.waitForSelector("[data-testid='origin-input']", { timeout: 10000 });
-    await page.fill("[data-testid='origin-input']", origin);
-    await page.click("[data-testid='origin-suggestion']"); // Select first suggestion
+    const page = await browser.newPage();
+    await page.goto(`https://www.smiles.com.ar/flight-search?origin=${origin}&destination=${destination}`, {
+      waitUntil: "networkidle2",
+      timeout: 120000
+    });
 
-    await page.fill("[data-testid='destination-input']", dest);
-    await page.click("[data-testid='destination-suggestion']");
+    await page.waitForSelector("app-flight-card", { timeout: 15000 });
 
-    await page.fill("[data-testid='departure-date']", dateISO);
-    await page.click("[data-testid='search-button']");
-
-    // Wait for results
-    await page.waitForSelector(".flight-card", { timeout: 30000 });
-
-    // Extract flights
     const flights = await page.evaluate(() => {
-      const rows = document.querySelectorAll(".flight-card");
-      return Array.from(rows).map(row => {
-        const airline = row.querySelector(".airline-name")?.innerText?.trim() || "GOL";
-        const originCode = row.querySelector(".origin-code")?.innerText?.trim() || null;
-        const destCode = row.querySelector(".dest-code")?.innerText?.trim() || null;
-        const dep = row.querySelector(".depart-time")?.innerText?.trim() || "";
-        const arr = row.querySelector(".arrival-time")?.innerText?.trim() || "";
-        
-        // Points and taxes from award sections
-        const econPts = row.querySelector("[data-testid='economy-points']")?.innerText?.match(/(\d+)/)?.[1] || null;
-        const busPts = row.querySelector("[data-testid='business-points']")?.innerText?.match(/(\d+)/)?.[1] || null;
-        const taxesText = row.querySelector(".taxes-amount")?.innerText?.trim() || "";
-        const taxesBRL = taxesText.match(/R\$\s*([\d.,]+)/)?.[1]?.replace(/\./g, '').replace(',', '.') || 0;
-
-        return { airline, originCode, destCode, dep, arr, econPts: parseInt(econPts) || null, busPts: parseInt(busPts) || null, taxesBRL: parseFloat(taxesBRL) };
-      }).filter(f => f.econPts || f.busPts);
+      const cards = [...document.querySelectorAll("app-flight-card")];
+      return cards.slice(0, 10).map(card => {
+        return {
+          priceMiles: parseInt(card.querySelector(".miles-sales")?.innerText?.replace(/\D/g, "")) || 0,
+          originCode: card.querySelector(".origin-airport-code")?.innerText || "",
+          destinationCode: card.querySelector(".destination-airport-code")?.innerText || "",
+          airline: card.querySelector(".airline-name")?.innerText?.trim() || "",
+          date: card.querySelector(".date")?.innerText?.trim() || ""
+        };
+      });
     });
 
     return flights;
-  } catch (e) {
-    console.error("Scrape error:", e.message);
+
+  } catch (err) {
+    console.error("Scraper error:", err);
     return [];
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
   }
 }
 
-function buildResponse({ flights, maxPoints = Infinity }) {
-  const valid = flights.filter(f => Math.min(f.econPts || Infinity, f.busPts || Infinity) <= maxPoints);
-  if (!valid.length) return "No award space found under your max points.";
+// ======= POINTS TO USD VALUE ========
+function pointsToUSD(points) {
+  if (points <= 20000) return points * 0.011;
+  if (points <= 35000) return points * 0.012;
+  if (points <= 70000) return points * 0.013;
+  return points * 0.014;
+}
 
-  const both = valid.filter(f => f.econPts && f.busPts);
-  const econOnly = valid.filter(f => f.econPts && !f.busPts);
-  const busOnly = valid.filter(f => !f.econPts && f.busPts);
+// ======= WHATSAPP WEBHOOK ========
+app.post("/whatsapp", async (req, res) => {
+  const incoming = req.body.Body?.trim()?.toUpperCase() || "";
 
-  function sortByDep(arr) {
-    return arr.sort((a, b) => a.dep.localeCompare(b.dep));
+  // Format example: MIA-BUE max=20000
+  const match = incoming.match(/^([A-Z]{3})-([A-Z]{3})(?:\s+MAX=(\d+))?/);
+
+  if (!match) {
+    return sendWhatsApp(req.body.From, "❌ Format incorrecto.\nEjemplo:\n*BUE-MIA max=20000*");
   }
 
-  const sections = [
-    { title: "Both Economy & Business", items: sortByDep(both) },
-    { title: "Economy only", items: sortByDep(econOnly) },
-    { title: "Business only", items: sortByDep(busOnly) },
-  ];
+  const origin = match[1];
+  const destination = match[2];
+  const max = match[3] ? parseInt(match[3]) : null;
 
-  let out = "";
-  sections.forEach(sec => {
-    if (!sec.items.length) return;
-    out += `=== ${sec.title} ===\n`;
+  const flights = await searchFlights(origin, destination);
+  if (!flights.length) {
+    return sendWhatsApp(req.body.From, `⚠️ No hay resultados para *${origin}-${destination}*`);
+  }
 
-    const byOriginAirline = {};
-    sec.items.forEach(f => {
-      const key = `\( {f.originCode || "ORIG"}- \){f.airline || "AIRLINE"}`;
-      byOriginAirline[key] = byOriginAirline[key] || [];
-      byOriginAirline[key].push(f);
-    });
+  let formatted = `✈️ *${origin} → ${destination}*\n🔎 Resultados Smiles:\n\n`;
 
-    Object.entries(byOriginAirline).forEach(([key, list]) => {
-      const [origin, airline] = key.split("-");
-      out += `\n\( {airline} from \){origin}:\n`;
-      list.forEach(f => {
-        const dep12 = to12Hour(f.dep);
-        const arr12 = to12Hour(f.arr);
-        const econ = f.econPts ? `${f.econPts}` : "-";
-        const bus = f.busPts ? `${f.busPts}` : "-";
-        const taxesUSD = f.taxesBRL ? brlToUsd(f.taxesBRL) : "-";
-        const lowestPts = econ !== "-" ? econ : bus;
-
-        out += `\( {origin} \){dep12} - \( {f.destCode} \){arr12}\n`;
-        out += `  Economy pts: \( {econ} | Business pts: \){bus}\n`;
-        out += `  1=${lowestPts} (points)  2=\[ {taxesUSD} (USD taxes)\n`;
-        if (f.econPts) out += `    (points value est: \]{ptsValueUsd(f.econPts).toFixed(2)})\n`;
-        if (f.busPts) out += `    (points value est: $${ptsValueUsd(f.busPts).toFixed(2)})\n`;
-      });
-    });
-    out += "\n";
+  flights.forEach(f => {
+    if (!max || f.priceMiles <= max) {
+      const usd = pointsToUSD(f.priceMiles).toFixed(2);
+      formatted += `• ${f.originCode} → ${f.destinationCode}\n`;
+      formatted += `  🏷 ${f.priceMiles.toLocaleString()} millas\n`;
+      formatted += `  💵 ~ $${usd} USD\n`;
+      formatted += `  🛫 ${f.airline} | 📅 ${f.date}\n\n`;
+    }
   });
 
-  return out;
-}
-
-app.post("/whatsapp-webhook", async (req, res) => {
-  try {
-    const incoming = (req.body.Body || "").trim().toUpperCase();
-    const match = incoming.match(/([A-Z]{3})-([A-Z]{3})\s+([\d-]{10})(?:\s+MAX=(\d+))?/i);
-    if (!match) {
-      return res.type("text/xml").send("<Response><Message>Format: NYC-GRU 2025-12-20 max=50000</Message></Response>");
-    }
-
-    const [, originCity, dest, dateISO, maxStr] = match;
-    const maxPoints = maxStr ? Number(maxStr) : Infinity;
-    const originAirports = originCity === "NYC" ? ["JFK", "LGA", "EWR"] : [originCity];
-
-    let allFlights = [];
-    for (const o of originAirports) {
-      const flights = await scrapeSmiles(o, dest, dateISO);
-      allFlights.push(...flights);
-    }
-
-    const responseText = buildResponse({ flights: allFlights, maxPoints });
-
-    res.type("text/xml").send(`
-<Response>
-  <Message>${responseText}</Message>
-</Response>
-    `.trim());
-  } catch (err) {
-    console.error(err);
-    res.type("text/xml").send("<Response><Message>Sorry, something went wrong. Try again later.</Message></Response>");
-  }
+  return sendWhatsApp(req.body.From, formatted);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Smiles WhatsApp Bot running on", PORT));
+// ======= SEND WHATSAPP ========
+function sendWhatsApp(to, message) {
+  client.messages.create({
+    from: TWILIO_NUMBER,
+    body: message,
+    to: to
+  });
+}
+
+// ======= START SERVER ========
+app.listen(PORT, () => console.log(`🚀 Bot running on port ${PORT}`));
