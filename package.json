@@ -1,0 +1,16 @@
+{
+  "name": "smiles-bot",
+  "version": "1.0.0",
+  "description": "Smiles award flight WhatsApp bot",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
